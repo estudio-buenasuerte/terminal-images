@@ -1,0 +1,7 @@
+{
+  "name": "terminal-images",
+  "version": "0.2.0",
+  "description": "Draws images inline in the Claude Code terminal: the ones Claude reads, the ones it sends you, and the ones you paste, drop or name in your own prompts",
+  "author": { "name": "Lucas Vocos" },
+  "license": "MIT"
+}
