@@ -1,0 +1,23 @@
+name: Check
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 7 * * 1'
+
+jobs:
+  check:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Claude Code
+        run: curl -fsSL https://claude.ai/install.sh | bash
+      - name: Add Claude Code to PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - run: claude --version
+      - run: claude plugin validate --strict .
+      - run: claude plugin test .

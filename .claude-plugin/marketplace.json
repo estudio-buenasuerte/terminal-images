@@ -1,0 +1,15 @@
+{
+  "name": "terminal-images",
+  "owner": {
+    "name": "Lucas Vocos",
+    "url": "https://github.com/estudio-buenasuerte"
+  },
+  "description": "Draws images inline in the Claude Code terminal: the ones Claude reads, the ones it sends you, and the ones you paste, drop or name in your own prompts",
+  "plugins": [
+    {
+      "name": "terminal-images",
+      "source": "./",
+      "description": "Draws images inline in the Claude Code terminal: the ones Claude reads, the ones it sends you, and the ones you paste, drop or name in your own prompts"
+    }
+  ]
+}

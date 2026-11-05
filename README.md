@@ -1,6 +1,6 @@
 # terminal-images
 
-A Claude Code mod that draws images inline in the terminal (Ghostty, kitty, tmux with passthrough) instead of a one-line `[image] file.png` or `[Image #1]` reference. Three cases:
+A Claude Code mod that draws images inline in supported terminals instead of a one-line `[image] file.png` or `[Image #1]` reference. Three cases:
 
 - **Images Claude reads** with the Read tool show up small under the "Read N files" line.
 - **Images Claude sends you** with SendUserFile (Remote Control sessions) show up large, caption above.
@@ -10,7 +10,22 @@ Every image has its path below it as a link that opens the file in your image vi
 
 ## Install
 
-The mod is loaded from this folder. Keep it under `~/.claude/skills/terminal-images` to have Claude Code load it in every session, or point one session at it:
+Inside Claude Code 2.1.275 or later:
+
+```
+/plugin install terminal-images --marketplace estudio-buenasuerte/terminal-images
+```
+
+Or from a shell:
+
+```
+claude plugin marketplace add estudio-buenasuerte/terminal-images
+claude plugin install terminal-images@terminal-images
+```
+
+### From a local checkout
+
+For development, keep this folder under `~/.claude/skills/terminal-images`, or symlink it there, to have Claude Code load it in every session. Or point one session at it:
 
 ```
 claude --plugin-dir ~/.claude/skills/terminal-images
@@ -18,20 +33,26 @@ claude --plugin-dir ~/.claude/skills/terminal-images
 
 A `--plugin-dir` load reloads on edits and prints `terminal-images: reloaded` in the transcript. The `~/.claude/skills` load does not; start a new session after changing the code.
 
-Requires Claude Code 2.1.287 or newer (mods support). Tested with 2.1.316.
+### Requirements
+
+- Marketplace install: Claude Code 2.1.275 or later.
+- Mods: Claude Code 2.1.287 or later.
+- iTerm2 pictures: Claude Code 2.1.305 or later.
+- tmux pictures: Claude Code 2.1.310 or later and tmux 3.3 or later, with `allow-passthrough` and `focus-events` on (see below).
+
+Tested by Lucas with Claude Code 2.1.318 on macOS in Ghostty and three libghostty apps: Flow, Enso and Ombú.
 
 ## Terminals
 
-| Terminal | Result |
-| --- | --- |
-| Ghostty | image |
-| kitty | image |
-| tmux with passthrough (see below) | image |
-| iTerm2 3.5+ in fullscreen rendering | image, per the Claude Code docs (not tested) |
-| tmux without passthrough, GNU screen | `[image] name.png` and the clickable path |
-| GNOME Terminal, Ptyxis, VS Code terminal | `[image] name.png` and the clickable path |
+| Platform | Pictures | Name and link only |
+| --- | --- | --- |
+| macOS | Ghostty, kitty, iTerm2 3.5+ (fullscreen rendering), tmux with passthrough, libghostty apps (Flow, Enso, Ombú) | Terminal.app, Warp, VS Code terminal |
+| Linux (untested) | kitty, Ghostty, Konsole 22.04+, WezTerm | GNOME Terminal, Ptyxis, foot, Alacritty, VS Code terminal |
+| Windows (untested) | WezTerm (kitty graphics, known gaps) | Windows Terminal (no kitty graphics yet), PowerShell console, VS Code terminal |
 
-The picture uses the kitty graphics protocol. Where the terminal cannot draw it, you get the file name and the path, never a broken box.
+Claude Code decides where pictures render. The mod only hands it the image.
+
+`CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` forces pictures when the engine does not detect the terminal.
 
 ### tmux
 
@@ -73,19 +94,26 @@ If the engine does not detect your terminal's image support, set `CLAUDE_CODE_FO
 - When a group of reads is expanded (ctrl+o), Claude Code's own rows are shown.
 - If you paste two images and remove one from the composer before sending, the newest file on disk may be the removed one, so the drawing can be off. The model still receives the right image.
 - Desktop app, VS Code extension and mobile are left untouched.
+- On native Windows, Claude Code's own image paste is Alt+V and reported unreliable; the mod draws whatever the engine received.
 
 ## Development
 
 ```
-claude plugin validate ~/.claude/skills/terminal-images
-claude plugin test ~/.claude/skills/terminal-images
-npx -p typescript tsc --noEmit -p ~/.claude/skills/terminal-images
+claude plugin validate --strict .
+claude plugin test .
+npx -p typescript tsc --noEmit -p .
 ```
 
 The tests cover the Read, SendUserFile and grouped-Read rendering, prompt path parsing, and engine-copy prompt rendering and redraws.
+
+GitHub Actions runs strict validation and the test kit on Ubuntu and macOS on every push, pull request and weekly on Monday at 07:00 UTC.
 
 The plugin API this mod uses is early access in Claude Code and may change between releases.
 
 ## Credits and license
 
-MIT. The Read and SendUserFile rendering is taken from Brian Pravato's inline-images plugin ([kbrianps/claude-inline-images](https://github.com/kbrianps/claude-inline-images), MIT); its license is kept in `LICENSE.upstream`.
+HEAVILY inspired by Brian Pravato's [claude-inline-images](https://github.com/kbrianps/claude-inline-images). I wanted to tweak it since I copy/paste images from my screenshotting tools so often. The Read and SendUserFile rendering came from that repo; the prompt-image part is mine.
+
+MIT. See [LICENSE](LICENSE). The upstream plugin is also MIT; its license is kept in `LICENSE.upstream`.
+
+See [CHANGELOG.md](CHANGELOG.md) for release history.
