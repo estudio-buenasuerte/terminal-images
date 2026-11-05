@@ -44,20 +44,22 @@ set -g focus-events on
 
 ## How prompt images are found
 
-Pasted and dropped attachments come from the numbered files Claude Code writes under `<CLAUDE_CODE_TMPDIR or /private/tmp>/claude-<uid>/<slug>/<session>/images/`, where the slug replaces every character outside `[a-zA-Z0-9]` in the working directory with `-` and, above 200 characters, uses the first 200 followed by `-` and an engine hash. The engine's copies are copied into the mod's capture folder and drawn from PNG bytes up to 2 MiB total per row; after a picture would exceed that budget, it and the remaining pictures are drawn from their capture-folder files. The engine writes one the moment an image is pasted, and the newest ones not yet drawn for an earlier prompt are that prompt's, so what is drawn is exactly what the model received, whatever the clipboard holds and whichever tool produced the image.
-
-Only when that folder cannot be located does the mod fall back to the clipboard: an attachment with a file name is matched to the clipboard's file by name, else found by name with Spotlight; one without a name is read from the clipboard as the file it points to, else as PNG bytes, else as the TIFF every macOS image copy carries. At most one such paste per prompt.
+Pasted and dropped images come only from the engine's own copies: the numbered files Claude Code writes under `<CLAUDE_CODE_TMPDIR or /private/tmp>/claude-<uid>/<slug>/<session>/images/`, where the slug replaces every character outside `[a-zA-Z0-9]` in the working directory with `-` and, above 200 characters, uses the first 200 followed by `-` and an engine hash. The engine's copies are copied into the mod's capture folder and drawn from PNG bytes up to 2 MiB total per row; after a picture would exceed that budget, it and the remaining pictures show only their clickable file links. The engine writes one the moment an image is pasted, and the newest ones not yet drawn for an earlier prompt are that prompt's, so what is drawn is exactly what the model received, whichever tool produced the image.
 
 Paths in the prompt text are drawn directly: absolute or `~/` paths ending in `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.heif`, `.tif`, `.tiff` or `.bmp`, plain, quoted or backslash-escaped, plus the `[Image: source: …]` marker the engine adds to a pasted image.
 
 A drawn row is remembered by its message id and by its text, so when the engine draws the same prompt again under another id (it does once the message is stored, and on later redraws) the pictures stay under it.
 
-The terminal draws PNG alone, so any other format is converted with `sips` into a private folder under `TMPDIR` (`claude-prompt-images`, mode 700), reused while the source is unchanged and pruned after a day. Clipboard captures go to the same folder. The prompt part is macOS only: it shells out to `osascript`, `sips` and `mdfind`.
+The terminal draws PNG alone, so any other format is converted with `sips` into a private folder under `TMPDIR` (`claude-prompt-images`, mode 700), reused while the source is unchanged and pruned after a day. The prompt part is macOS only: it shells out to `sips`.
+
+## Known limits
+
+- Two prompt rows with identical text can be matched to the same pictures: the engine gives mods no per-prompt identity that survives redraws.
+- A picture over 2 MiB, over the 2 MiB per-row budget, unreadable, or with an invalid PNG header shows only its clickable file path instead of a picture.
 
 ## What it does not do
 
 - Read and SendUserFile images are PNG only, because the terminal image element takes PNG or raw pixels: a JPEG Claude reads keeps Claude Code's default line.
-- PNGs over 2 MiB are drawn from the file path, which needs the terminal to read the file itself: it works in local Ghostty and kitty, not over SSH or inside tmux.
 - When a group of reads is expanded (ctrl+o), Claude Code's own rows are shown.
 - If you paste two images and remove one from the composer before sending, the newest file on disk may be the removed one, so the drawing can be off. The model still receives the right image.
 - Desktop app, VS Code extension and mobile are left untouched.
@@ -70,7 +72,7 @@ claude plugin test ~/.claude/skills/terminal-images
 npx -p typescript tsc --noEmit -p ~/.claude/skills/terminal-images
 ```
 
-The tests cover the Read, SendUserFile and grouped-Read rendering, prompt path parsing, and engine-copy prompt rendering and redraws. The clipboard and Spotlight paths need a live session.
+The tests cover the Read, SendUserFile and grouped-Read rendering, prompt path parsing, and engine-copy prompt rendering and redraws.
 
 The plugin API this mod uses is early access in Claude Code and may change between releases.
 

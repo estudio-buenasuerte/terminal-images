@@ -1,6 +1,6 @@
 import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
-import { cwdSlug, pathsIn } from './register'
+import { cwdSlug, pathsIn, pngSize } from './register'
 
 const HOME = '/Users/me'
 
@@ -59,7 +59,7 @@ const engine = (on: On) =>
   })
 
 test('draws a PNG inline in the terminal with its path below', async ($, on) => {
-  engine(on)
+  promptEngine(on)
   const ui = await $.ui.mount(result({ caption: 'Before and after', attachments: [png] }))
 
   expect(await ui.find({ type: 'Image' })).toBeTruthy()
@@ -69,8 +69,11 @@ test('draws a PNG inline in the terminal with its path below', async ($, on) => 
 })
 
 test('leaves every other surface to the engine', async ($, on) => {
-  engine(on)
+  const { reads, runs } = promptEngine(on)
   const ui = await $.ui.mount(result({ attachments: [png] }, 'desktop'))
+
+  expect(reads).toEqual([])
+  expect(runs).toEqual([])
 
   expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
   await ui.unmount()
@@ -181,7 +184,28 @@ const promptEngine = (on: On, { cwd = CWD, tmpRoot = '', sizes = [95] } = {}) =>
   const runs: string[][] = []
   const lists: string[] = []
   const reads: string[] = []
-  const state = { visible: true, copyExitCode: 0 }
+  const state: {
+    visible: boolean
+    folderExists: boolean
+    visibleCount: number
+    copyExitCode: number
+    mtimeMs: number
+    base64: string
+    readFails: boolean
+    gatedPath?: string
+    readGate?: Promise<void>
+    onRead?: () => void
+    conversionGate?: Promise<void>
+    onConvert?: () => void
+  } = {
+    visible: true,
+    folderExists: true,
+    visibleCount: sizes.length,
+    copyExitCode: 0,
+    mtimeMs: 1,
+    base64: TINY_PNG,
+    readFails: false,
+  }
 
   mock.env(on, { HOME, TMPDIR: '/tmp/t', CLAUDE_CODE_TMPDIR: tmpRoot })
   mock.clock(on)
@@ -197,23 +221,32 @@ const promptEngine = (on: On, { cwd = CWD, tmpRoot = '', sizes = [95] } = {}) =>
       e.path === uidDir
         ? [entry('unrelated', 'dir', 0), entry(`${slug}-file`, 'file', 95), entry(`${slug}-missing`, 'dir', 0), entry(`${slug}-hash`, 'dir', 0)]
         : e.path === dir && state.visible
-          ? sizes.map((size, index) => entry(`${index + 1}.png`, 'file', size))
+          ? sizes.slice(0, state.visibleCount).map((size, index) => entry(`${index + 1}.png`, 'file', size))
           : []
     return { value: entries }
   })
-  on('fs.exists', ($, e) => ({ value: e.path === dir }))
+  on('fs.exists', ($, e) => ({ value: state.folderExists && e.path === dir }))
   on('fs.stat', ($, e) => ({ value: {
     kind: 'file',
     size: sizes[Number(/(\d+)\.png$/.exec(e.path)?.[1] ?? 1) - 1] ?? 95,
-    mtimeMs: 1,
+    mtimeMs: state.mtimeMs,
     isLink: false,
   } }))
-  on('fs.read', ($, e) => {
+  on('fs.read', async ($, e) => {
     reads.push(e.path)
-    return { value: { base64: TINY_PNG } }
+    if (e.path === state.gatedPath) {
+      state.onRead?.()
+      await state.readGate
+    }
+    if (state.readFails) throw new Error('unreadable')
+    return { value: { base64: state.base64 } }
   })
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     runs.push([...e.argv])
+    if (e.argv[0] === 'sips' && e.argv[1] === '-s') {
+      state.onConvert?.()
+      await state.conversionGate
+    }
     const stdout = e.argv[0] === 'sh'
       ? `${HOME}\n/tmp/t\n501`
       : e.argv[0] === 'sips' ? 'pixelWidth: 4\npixelHeight: 2' : ''
@@ -279,7 +312,7 @@ test('copies a pasted image once and draws its bytes again under another message
 
   for (const requestId of ['m1', 'm2', 'm1']) {
     const ui = await $.ui.mount(message('a pasted image', requestId))
-    expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: TINY_PNG })
+    expect(await ui.find({ type: 'Image' })).toBeTruthy()
     expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
     await ui.unmount()
     state.visible = false
@@ -294,15 +327,14 @@ test('copies a pasted image once and draws its bytes again under another message
   expect(runs.find(argv => argv[0] === 'find')?.includes('engine-*')).toBe(true)
 })
 
-test('draws a large pasted PNG from its capture-folder copy', async ($, on) => {
+test('links a large pasted PNG without drawing an Image', async ($, on) => {
   const { reads } = promptEngine(on, { sizes: [INLINE_BYTES + 1] })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
   await $.prompt.submit(prompt('a large pasted image'))
   const ui = await $.ui.mount(message('a large pasted image'))
 
-  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({
-    file: `${CAPTURE_DIR}/engine-sess1-1.png`, format: 'png', generation: 1,
-  })
+  expect(await ui.find({ type: 'Image' })).toBeFalsy()
+  expect(await ui.find({ type: 'Link', text: `${CAPTURE_DIR}/engine-sess1-1.png` })).toBeTruthy()
   expect(reads).toEqual([])
   await ui.unmount()
 })
@@ -313,25 +345,21 @@ test('draws PNG bytes at the exact inline limit', async ($, on) => {
   await $.prompt.submit(prompt('an image at the limit'))
   const ui = await $.ui.mount(message('an image at the limit'))
 
-  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: TINY_PNG })
+  expect(await ui.find({ type: 'Image' })).toBeTruthy()
   await ui.unmount()
 })
 
-test('uses the inline budget in picture order and keeps later pictures on files', async ($, on) => {
+test('uses the inline budget in picture order and links later pictures', async ($, on) => {
   promptEngine(on, { sizes: [1.5 * 1024 * 1024, 1.5 * 1024 * 1024, 95] })
   await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
   await $.prompt.submit(prompt('three pasted images', 3))
   const ui = await $.ui.mount(message('three pasted images'))
 
-  expect((await ui.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-1.png` }))?.props.source).toEqual({
-    png: TINY_PNG,
-  })
+  expect(await ui.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-1.png` })).toBeTruthy()
   for (const index of [2, 3]) {
-    expect((await ui.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-${index}.png` }))?.props.source).toEqual({
-      file: `${CAPTURE_DIR}/engine-sess1-${index}.png`,
-      format: 'png',
-      generation: 1,
-    })
+    const path = `${CAPTURE_DIR}/engine-sess1-${index}.png`
+    expect(await ui.find({ type: 'Image', key: path })).toBeFalsy()
+    expect(await ui.find({ type: 'Link', text: path })).toBeTruthy()
   }
   await ui.unmount()
 })
@@ -364,4 +392,233 @@ test('keeps an engine image pending until the file appears for a redraw', async 
   expect(await later.find({ type: 'Image' })).toBeTruthy()
   expect(runs.filter(argv => argv[0] === 'cp').length).toBe(1)
   await later.unmount()
+})
+
+test('rejects empty, truncated, non-PNG and malformed base64 headers without throwing', async () => {
+  for (const base64 of ['', 'iVBORw==', TINY_PNG.slice(0, 28), 'aGVsbG8=', '!@#$%', `AVBORw0KGgo${TINY_PNG.slice(11)}`, `iVBORwAAAAA${TINY_PNG.slice(11)}`]) {
+    expect(pngSize(base64)).toBe(null)
+  }
+  expect(pngSize(TINY_PNG)).toEqual({ width: 4, height: 2 })
+})
+
+test('applies one inline budget to all PNGs in a collapsed Read group', async ($, on) => {
+  engine(on)
+  const base64 = TINY_PNG.slice(0, 32).padEnd(2 * 1024 * 1024, 'A')
+  const grouped = group('image/png')
+  const calls = [1, 2].map(index => ({
+    ...grouped.props.calls[0],
+    tool_use_id: `read-${index}`,
+    input: { file_path: `/tmp/budget-${index}.png` },
+    output: {
+      ...read('image/png').props.output,
+      file: { ...read('image/png').props.output.file, base64 },
+    },
+  }))
+  const ui = await $.ui.mount({ ...grouped, props: { ...grouped.props, calls } })
+
+  expect(await ui.find({ type: 'Image', key: '/tmp/budget-1.png' })).toBeTruthy()
+  expect(await ui.find({ type: 'Image', key: '/tmp/budget-2.png' })).toBeFalsy()
+  expect(await ui.find({ type: 'Link', text: '/tmp/budget-2.png' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('applies one inline budget to all SendUserFile attachments', async ($, on) => {
+  promptEngine(on)
+  const attachments = [1, 2].map(index => ({ ...png, path: `/tmp/send-${index}.png`, size: 1.5 * 1024 * 1024 }))
+  const ui = await $.ui.mount(result({ attachments }))
+
+  expect(await ui.find({ type: 'Image', key: '/tmp/send-1.png' })).toBeTruthy()
+  expect(await ui.find({ type: 'Image', key: '/tmp/send-2.png' })).toBeFalsy()
+  expect(await ui.find({ type: 'Link', text: '/tmp/send-2.png' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('reads new prompt bytes when the same filename has a new modification time', async ($, on) => {
+  const { reads, state } = promptEngine(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('first /tmp/changed.png', 0))
+  const first = await $.ui.mount(message('first /tmp/changed.png'))
+  expect(await first.find({ type: 'Image', key: '/tmp/changed.png' })).toBeTruthy()
+  await first.unmount()
+
+  state.mtimeMs = 2
+  state.base64 = 'invalid new bytes'
+  await $.prompt.submit(prompt('second /tmp/changed.png', 0))
+  const later = await $.ui.mount(message('second /tmp/changed.png', 'm2'))
+  expect(reads.filter(path => path === '/tmp/changed.png').length >= 2).toBe(true)
+  expect(await later.find({ type: 'Image' })).toBeFalsy()
+  expect(await later.find({ type: 'Link', text: '/tmp/changed.png' })).toBeTruthy()
+  await later.unmount()
+})
+
+test('recovers a pasted attachment independently of a typed image path', async ($, on) => {
+  promptEngine(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('compare /tmp/typed.png with this paste'))
+  const ui = await $.ui.mount(message('compare /tmp/typed.png with this paste'))
+
+  expect(await ui.find({ type: 'Image', key: '/tmp/typed.png' })).toBeTruthy()
+  expect(await ui.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-1.png` })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('keeps partially resolved engine copies pending across redraws of the same row', async ($, on) => {
+  const { state, runs } = promptEngine(on, { sizes: [95, 95] })
+  state.visibleCount = 1
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('two copies arriving separately', 2))
+  const first = await $.ui.mount(message('two copies arriving separately'))
+  expect(await first.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-1.png` })).toBeTruthy()
+  expect(await first.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-2.png` })).toBeFalsy()
+  await first.unmount()
+
+  state.visibleCount = 2
+  const later = await $.ui.mount(message('two copies arriving separately'))
+  expect(await later.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-1.png` })).toBeTruthy()
+  expect(await later.find({ type: 'Image', key: `${CAPTURE_DIR}/engine-sess1-2.png` })).toBeTruthy()
+  expect(runs.filter(argv => argv[0] === 'cp').length).toBe(2)
+  await later.unmount()
+})
+
+test('does not wait for engine copies when the short-cwd images folder is absent', async ($, on) => {
+  const { state, lists, runs } = promptEngine(on)
+  state.folderExists = false
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('missing images directory'))
+  const first = await $.ui.mount(message('missing images directory'))
+  expect(await first.find({ type: 'Image' })).toBeFalsy()
+  await first.unmount()
+
+  state.folderExists = true
+  const later = await $.ui.mount(message('missing images directory', 'm2'))
+  expect(await later.find({ type: 'Image' })).toBeFalsy()
+  expect(lists).toEqual([])
+  expect(runs.some(argv => argv[0] === 'cp')).toBe(false)
+  await later.unmount()
+})
+
+test('does no file or process work on non-terminal rendering surfaces', async ($, on) => {
+  const { reads, runs, lists } = promptEngine(on)
+  const events = [
+    { ...result({ attachments: [png] }), surface: 'desktop' as const },
+    { ...read('image/png'), surface: 'desktop' as const },
+    { ...group('image/png'), surface: 'desktop' as const },
+    { ...message('non-terminal /tmp/shot.png'), surface: 'desktop' as const },
+  ]
+  for (const event of events) {
+    const ui = await $.ui.mount(event)
+    expect((await ui.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
+    await ui.unmount()
+  }
+  expect(reads).toEqual([])
+  expect(runs).toEqual([])
+  expect(lists).toEqual([])
+})
+
+test('continues submit while a path conversion is still running', async ($, on) => {
+  const { state } = promptEngine(on)
+  let finishConversion!: () => void
+  let startedConversion!: () => void
+  state.conversionGate = new Promise<void>(resolve => { finishConversion = resolve })
+  const started = new Promise<void>(resolve => { startedConversion = resolve })
+  state.onConvert = startedConversion
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('convert /tmp/photo.jpg', 0))
+  await started
+  finishConversion()
+  const ui = await $.ui.mount(message('convert /tmp/photo.jpg'))
+
+  expect(await ui.find({ type: 'Image', key: '/tmp/photo.jpg' })).toBeTruthy()
+  await ui.unmount()
+})
+
+test('removes a claimed pending entry by identity after concurrent submits shift the array', async ($, on) => {
+  const { state } = promptEngine(on)
+  state.visible = false
+  let finishRead!: () => void
+  let startedRead!: () => void
+  state.gatedPath = '/tmp/slow.png'
+  state.readGate = new Promise<void>(resolve => { finishRead = resolve })
+  const started = new Promise<void>(resolve => { startedRead = resolve })
+  state.onRead = startedRead
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('older pending attachment'))
+  await $.prompt.submit(prompt('slow /tmp/slow.png', 0))
+  const drawing = $.ui.mount(message('slow /tmp/slow.png'))
+  await started
+  for (let index = 0; index < 19; index += 1) {
+    await $.prompt.submit(prompt(`new pending ${index}`))
+    const waiting = await $.ui.mount(message(`new pending ${index}`, `waiting-${index}`))
+    expect(await waiting.find({ type: 'Image' })).toBeFalsy()
+    await waiting.unmount()
+  }
+  finishRead()
+  const first = await drawing
+  expect(await first.find({ type: 'Image' })).toBeTruthy()
+  await first.unmount()
+
+  state.visible = true
+  const later = await $.ui.mount(message('new pending 0', 'm2'))
+  expect(await later.find({ type: 'Image' })).toBeTruthy()
+  await later.unmount()
+})
+
+test('uses a link when SendUserFile bytes are oversized, unreadable or invalid', async ($, on) => {
+  const { state } = promptEngine(on)
+  for (const mode of ['oversized', 'unreadable', 'invalid']) {
+    state.readFails = mode === 'unreadable'
+    state.base64 = mode === 'invalid' ? 'not PNG bytes' : TINY_PNG
+    const path = `/tmp/${mode}.png`
+    const ui = await $.ui.mount(result({ attachments: [{ ...png, path, size: mode === 'oversized' ? INLINE_BYTES + 1 : 95 }] }))
+    expect(await ui.find({ type: 'Image' })).toBeFalsy()
+    expect(await ui.find({ type: 'Link', text: path })).toBeTruthy()
+    await ui.unmount()
+  }
+})
+
+test('uses a link when prompt bytes are unreadable or invalid', async ($, on) => {
+  const { state } = promptEngine(on)
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  for (const mode of ['unreadable', 'invalid']) {
+    state.readFails = mode === 'unreadable'
+    state.base64 = mode === 'invalid' ? 'not PNG bytes' : TINY_PNG
+    const path = `/tmp/${mode}.png`
+    const text = `inspect ${path}`
+    await $.prompt.submit(prompt(text, 0))
+    const ui = await $.ui.mount(message(text, mode))
+    expect(await ui.find({ type: 'Image' })).toBeFalsy()
+    expect(await ui.find({ type: 'Link', text: path })).toBeTruthy()
+    await ui.unmount()
+  }
+})
+
+test('links invalid Read bytes with a known path and leaves unknown paths to the engine', async ($, on) => {
+  engine(on)
+  const invalid = { ...read('image/png').props.output, file: { ...read('image/png').props.output.file, base64: '' } }
+  const grouped = group('image/png')
+  const ui = await $.ui.mount({
+    ...grouped,
+    props: { ...grouped.props, calls: [{ ...grouped.props.calls[0], output: invalid }] },
+  })
+  expect(await ui.find({ type: 'Image' })).toBeFalsy()
+  expect(await ui.find({ type: 'Link', text: '/tmp/test.png' })).toBeTruthy()
+  await ui.unmount()
+
+  const unknown = read('image/png')
+  const fallback = await $.ui.mount({ ...unknown, props: { ...unknown.props, output: invalid } })
+  expect(await fallback.find({ type: 'Image' })).toBeFalsy()
+  expect((await fallback.find({ type: 'Text', text: /engine/ }))?.text).toBe('engine')
+  await fallback.unmount()
+})
+
+test('links an empty prompt PNG instead of losing its path', async ($, on) => {
+  const { state } = promptEngine(on, { sizes: [0] })
+  state.base64 = ''
+  await $.session.start({ surface: 'terminal', isInteractive: true, cwd: CWD })
+  await $.prompt.submit(prompt('inspect /tmp/empty.png', 0))
+  const ui = await $.ui.mount(message('inspect /tmp/empty.png'))
+
+  expect(await ui.find({ type: 'Image' })).toBeFalsy()
+  expect(await ui.find({ type: 'Link', text: '/tmp/empty.png' })).toBeTruthy()
+  await ui.unmount()
 })

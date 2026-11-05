@@ -13,7 +13,6 @@ const READ_MAX_ROWS = 15
 const READ_PATHS_LIMIT = 200
 const MARGIN = 4
 const CELL_RATIO = 2
-const MAX_READ_BYTES = 4 * 1024 * 1024
 const MAX_INLINE_BYTES = 2 * 1024 * 1024
 const CACHE_LIMIT = 24
 const FALLBACK_SIZE: TSize = { width: 1600, height: 1000 }
@@ -23,7 +22,9 @@ const readPaths = new Map<string, string>()
 
 const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
 
+// Reject malformed bytes so a bad image cannot break a transcript redraw.
 const decodeBase64 = (text: string) => {
+  if (!/^[A-Za-z0-9+/]*={0,2}$/.test(text) || text.length % 4 === 1) return new Uint8Array()
   const bytes: number[] = []
   let buffer = 0
   let bits = 0
@@ -42,14 +43,21 @@ const decodeBase64 = (text: string) => {
   return new Uint8Array(bytes)
 }
 
-const pngSize = (base64: string): TSize | null => {
+// Only a complete PNG header supplies usable dimensions for an inline picture.
+export const pngSize = (base64: string): TSize | null => {
   const header = decodeBase64(base64.slice(0, 44))
-  const isSignature = header[1] === 0x50 && header[2] === 0x4e && header[3] === 0x47
-  if (!isSignature) return null
+  const signature = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]
+  if (header.length < 24 || !signature.every((byte, index) => header[index] === byte)) return null
 
   const view = new DataView(header.buffer)
-  return { width: view.getUint32(16), height: view.getUint32(20) }
+  const width = view.getUint32(16)
+  const height = view.getUint32(20)
+  return width > 0 && height > 0 ? { width, height } : null
 }
+
+// Padding is not decoded data and must not push an exact-limit PNG over budget.
+const pngBytes = (base64: string) =>
+  (base64.length * 3) / 4 - (base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0)
 
 const isDrawable = (file: TAttachment) =>
   file.isImage &&
@@ -84,20 +92,23 @@ const boxFor = ({ width, height }: TSize, maxColumns: number, maxRows: number) =
   return { columns: Math.min(columns, 255), rows: Math.min(rows, 255) }
 }
 
-type TReadImage = { base64: string; size: TSize; path?: string }
+type TReadImage = { base64: string | null; size: TSize; bytes: number; path?: string }
 
+// Keep a known path even when its bytes cannot be drawn, so the row can link it.
 const readImage = (output: unknown, path?: string): TReadImage | null => {
   const read = output as TReadOutput | undefined
   if (!read || read.type !== 'image' || read.file.type !== 'image/png') return null
 
   const { base64, dimensions } = read.file
-  if ((base64.length * 3) / 4 > MAX_INLINE_BYTES) return null
-
+  const bytes = pngBytes(base64)
+  const header = pngSize(base64)
   const width = dimensions?.originalWidth ?? dimensions?.displayWidth
   const height = dimensions?.originalHeight ?? dimensions?.displayHeight
-  const size = width && height ? { width, height } : pngSize(base64)
+  const size = header && width && height ? { width, height } : header
+  const inline = size !== null && bytes <= MAX_INLINE_BYTES
+  if (!inline && !path) return null
 
-  return size ? { base64, size, path } : null
+  return { base64: inline ? base64 : null, size: size ?? FALLBACK_SIZE, bytes, path }
 }
 
 // ---- the person's own prompts ----
@@ -106,13 +117,13 @@ const readImage = (output: unknown, path?: string): TReadImage | null => {
 type TPromptPicture = { file: string; source: string; size: TSize; bytes: number; generation: number }
 // The engine's own copies of a prompt's attachments, still to be read: the
 // folder it writes them to and how many the prompt attached.
-type TEngineImages = { dir: string; wanted: number }
+type TEngineImages = { dir: string; wanted: number; resolved: number }
 type TPending = {
   text: string
   pictures: TPromptPicture[]
   at: number
   engine?: TEngineImages
-  // A read of the engine's copies started at submit and not yet finished.
+  // File resolution started at submit and not yet finished.
   resolving?: Promise<void>
 }
 
@@ -128,12 +139,15 @@ const CWD_SLUG_LIMIT = 200
 // Rows retain paths alone so old transcript pictures do not retain megabytes of bytes.
 const promptPngs = new Map<string, string>()
 
-const promptPng = async ($: EngineInterface, file: string): Promise<string | null> => {
+// Cache each file version separately so an overwrite cannot reuse stale bytes.
+const promptPng = async ($: EngineInterface, file: string, generation: number): Promise<string | null> => {
+  const key = `${file}:${generation}`
   try {
-    const cached = promptPngs.get(file)
+    const cached = promptPngs.get(key)
     const base64 = cached ?? (await $.fs.read(file, { as: 'bytes' })).base64
-    promptPngs.delete(file)
-    promptPngs.set(file, base64)
+    if (!pngSize(base64)) return null
+    promptPngs.delete(key)
+    promptPngs.set(key, base64)
     if (promptPngs.size > CACHE_LIMIT) {
       const oldest = promptPngs.keys().next().value
       if (oldest !== undefined) promptPngs.delete(oldest)
@@ -169,12 +183,9 @@ const rememberRow = (requestId: string, text: string, pictures: TPromptPicture[]
 let home = ''
 let uid = ''
 let captureDir = ''
-let generation = 0
 
 // Only the person's own prompts: typed here, or sent from Remote Control.
 const isOwn = (origin: PromptOrigin) => origin.kind === 'composer' || origin.kind === 'bridge'
-// The Mac clipboard belongs to a prompt typed at this terminal alone.
-const isLocal = (origin: PromptOrigin) => origin.kind === 'composer'
 
 const rememberPending = (entry: TPending) => {
   pending.push(entry)
@@ -188,7 +199,7 @@ const forgetPending = (entry: TPending) => {
 
 const claim = async ($: EngineInterface, requestId: string, text: string, now: number) => {
   const known = rows.get(requestId)
-  if (known) return known
+  if (known && !pending.some(entry => entry.text === text)) return known
 
   for (let index = pending.length - 1; index >= 0; index -= 1) {
     if (now - (pending[index]?.at ?? now) > PENDING_TTL_MS) pending.splice(index, 1)
@@ -203,20 +214,22 @@ const claim = async ($: EngineInterface, requestId: string, text: string, now: n
   }
 
   if (entry.resolving) await entry.resolving
-  else if (entry.engine) await resolveEngineImages($, entry)
+  else if (entry.engine) {
+    entry.resolving = resolveEngineImages($, entry).finally(() => {
+      entry.resolving = undefined
+    })
+    await entry.resolving
+  }
   // The engine's copies are not on disk yet: the row stays pending for a later redraw.
   if (entry.pictures.length === 0) return null
 
-  pending.splice(index, 1)
+  if (!entry.engine) forgetPending(entry)
   rememberRow(requestId, text, entry.pictures)
 
   return entry.pictures
 }
 
 
-
-// A string inside AppleScript double quotes.
-const appleScriptString = (text: string) => text.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 
 // Every still-image format `sips` turns into PNG; the terminal draws PNG alone.
 const IMAGE_PATTERN = /\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i
@@ -292,12 +305,11 @@ const toPng = async ($: EngineInterface, source: string, generation: number): Pr
 const pictureFor = async ($: EngineInterface, source: string): Promise<TPromptPicture | null> => {
   try {
     const stat = await $.fs.stat(source)
-    if (stat.kind !== 'file' || stat.size === 0) return null
-    const generation = Math.round(stat.mtimeMs)
-    const file = isPng(source) ? source : await toPng($, source, generation)
-    if (!file) return null
+    if (stat.kind !== 'file') return null
+    const generation = stat.mtimeMs
+    const file = isPng(source) ? source : (await toPng($, source, generation)) ?? source
     const bytes = file === source ? stat.size : (await $.fs.stat(file)).size
-    const png = bytes <= MAX_INLINE_BYTES ? await promptPng($, file) : null
+    const png = bytes <= MAX_INLINE_BYTES ? await promptPng($, file, generation) : null
     const size = (png && pngSize(png)) || await sizeOf($, file)
     return { file, source, size, bytes, generation }
   } catch {
@@ -305,93 +317,9 @@ const pictureFor = async ($: EngineInterface, source: string): Promise<TPromptPi
   }
 }
 
-// The clipboard's image written to `target` as `expression` names it
-// (`«class PNGf»`, `TIFF picture`): the path when bytes landed, else null.
-const writeClipboard = async ($: EngineInterface, target: string, expression: string): Promise<string | null> => {
-  try {
-    const { exitCode } = await $.process.run(
-      [
-        'osascript',
-        '-e', `set f to open for access POSIX file "${appleScriptString(target)}" with write permission`,
-        '-e', 'try',
-        '-e', `write (the clipboard as ${expression}) to f`,
-        '-e', 'end try',
-        '-e', 'close access f',
-      ],
-      { timeoutMs: 10000 },
-    )
-    if (exitCode === 0) {
-      const stat = await $.fs.stat(target)
-      if (stat.size > 0) return target
-    }
-  } catch {
-    // fall through to the cleanup
-  }
-  await $.process.run(['rm', '-f', target], { timeoutMs: 5000 }).catch(() => null)
-  return null
-}
-
-const baseName = (path: string) => path.split('/').pop() ?? path
-
-// The image file the clipboard points at (screenshot tools and Finder copies
-// carry one), or null when it holds text, bytes alone, or nothing.
-const clipboardFile = async ($: EngineInterface): Promise<string | null> => {
-  try {
-    const asFile = await $.process.run(
-      ['osascript', '-e', 'POSIX path of (the clipboard as «class furl»)'],
-      { timeoutMs: 5000 },
-    )
-    // A text clipboard comes back as that text with exit 0: insist on an image file.
-    const filePath = asFile.stdout.trim()
-    if (asFile.exitCode === 0 && filePath.startsWith('/') && IMAGE_PATTERN.test(filePath)) {
-      const stat = await $.fs.stat(filePath).catch(() => null)
-      if (stat?.kind === 'file') return filePath
-    }
-  } catch {
-    // no file on the clipboard
-  }
-  return null
-}
-
-// The clipboard's image bytes written to a private file of our own: PNG where
-// the tool offers it, else the TIFF every macOS image copy carries.
-const clipboardBytes = async ($: EngineInterface): Promise<string | null> => {
-  if (!captureDir) return null
-  generation += 1
-  const stem = `${captureDir}/paste-${Date.now()}-${generation}`
-  const png = await writeClipboard($, `${stem}.png`, '«class PNGf»')
-  if (png) return png
-  return writeClipboard($, `${stem}.tiff`, 'TIFF picture')
-}
-
-// A dropped file by the name the engine kept for it: Spotlight's matches with
-// exactly that name, the most recently modified one. A drop never touches the
-// clipboard, so the clipboard is no witness to it.
-const locateByName = async ($: EngineInterface, filename: string): Promise<string | null> => {
-  if (filename.includes('/') || !IMAGE_PATTERN.test(filename)) return null
-  try {
-    const { exitCode, stdout } = await $.process.run(['mdfind', '-name', filename], { timeoutMs: 5000 })
-    if (exitCode !== 0) return null
-    const matches = stdout
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.startsWith('/') && baseName(line) === filename)
-      .slice(0, 20)
-    let best: { path: string; mtimeMs: number } | null = null
-    for (const path of matches) {
-      const stat = await $.fs.stat(path).catch(() => null)
-      if (stat?.kind === 'file' && stat.size > 0 && (!best || stat.mtimeMs > best.mtimeMs))
-        best = { path, mtimeMs: stat.mtimeMs }
-    }
-    return best?.path ?? null
-  } catch {
-    return null
-  }
-}
-
 export const cwdSlug = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, '-').slice(0, CWD_SLUG_LIMIT)
 
-// The engine's copies are what the model receives, whatever the clipboard holds.
+// Verify the engine's copy folder before keeping a prompt waiting for files.
 const engineImagesDir = async ($: EngineInterface): Promise<string | null> => {
   if (!uid) return null
   try {
@@ -400,7 +328,10 @@ const engineImagesDir = async ($: EngineInterface): Promise<string | null> => {
     const root = ((await $.env.get('CLAUDE_CODE_TMPDIR')) || '/private/tmp').replace(/\/$/, '')
     const dir = `${root}/claude-${uid}`
     const slug = cwdSlug(cwd)
-    if (cwd.length <= CWD_SLUG_LIMIT) return `${dir}/${slug}/${id}/images`
+    if (cwd.length <= CWD_SLUG_LIMIT) {
+      const images = `${dir}/${slug}/${id}/images`
+      return await $.fs.exists(images) ? images : null
+    }
 
     // The engine appends a hash we cannot compute to a truncated slug.
     const entries = await $.fs.list(dir)
@@ -440,7 +371,9 @@ const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
   const engine = entry.engine
   if (!engine || !captureDir) return
   const names = await engineImages($, engine.dir)
-  const fresh = names.filter(name => !claimedEngineFiles.has(`${engine.dir}/${name}`)).slice(-engine.wanted)
+  const fresh = names
+    .filter(name => !claimedEngineFiles.has(`${engine.dir}/${name}`))
+    .slice(-(engine.wanted - engine.resolved))
   if (fresh.length === 0) return
 
   try {
@@ -453,6 +386,7 @@ const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
       if (exitCode !== 0) continue
       const picture = await pictureFor($, target)
       if (!picture) continue
+      engine.resolved += 1
       claimedEngineFiles.add(path)
       if (claimedEngineFiles.size > CLAIMED_LIMIT) {
         const oldest = claimedEngineFiles.values().next().value
@@ -460,7 +394,7 @@ const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
       }
       if (!entry.pictures.some(known => known.source === picture.source)) entry.pictures.push(picture)
     }
-    if (fresh.every(name => claimedEngineFiles.has(`${engine.dir}/${name}`))) entry.engine = undefined
+    if (engine.resolved >= engine.wanted) entry.engine = undefined
   } catch {
     // a copy that failed stays pending for a later redraw
   }
@@ -496,11 +430,17 @@ export const register: Register = on => {
   on('ui.render', { component: 'ToolGroup' }, async ($, e, next) => {
     if (e.surface !== 'terminal' || e.props.isExpanded) return next(e)
 
+    let remaining = MAX_INLINE_BYTES
     const images = e.props.calls.flatMap(call => {
       if (call.tool !== 'Read' || call.isRunning || call.isErrored || call.isInterrupted) return []
       const path = (call.input as { file_path?: string } | undefined)?.file_path
       const image = readImage(call.output, path)
-      return image ? [image] : []
+      if (!image) return []
+      const inline = image.base64 !== null && image.bytes <= remaining
+      if (image.bytes > remaining) remaining = 0
+      else if (inline) remaining -= image.bytes
+      if (!inline && !path) return []
+      return [{ ...image, base64: inline ? image.base64 : null }]
     })
     if (images.length === 0) return next(e)
 
@@ -518,10 +458,18 @@ export const register: Register = on => {
 
           return (
             <Box key={`${index}:${image.path ?? ''}`} flexDirection="column" gap={1} marginLeft={2}>
-              <Image source={{ png: image.base64 }} columns={box.columns} rows={box.rows} alt={`[image] ${name}`} />
+              {image.base64 ? (
+                <Image
+                  key={image.path ?? 'read'}
+                  source={{ png: image.base64 }}
+                  columns={box.columns}
+                  rows={box.rows}
+                  alt={`[image] ${name}`}
+                />
+              ) : null}
               {image.path ? (
                 <Text dimColor>
-                  <Link href={fileUrl(image.path)} label={image.path} />
+                  <Link key={image.path} href={fileUrl(image.path)} label={image.path} />
                 </Text>
               ) : null}
             </Box>
@@ -558,10 +506,18 @@ export const register: Register = on => {
 
     return (
       <Box flexDirection="column" gap={1} marginBottom={1}>
-        <Image source={{ png: image.base64 }} columns={box.columns} rows={box.rows} alt={`[image] ${name}`} />
+        {image.base64 ? (
+          <Image
+            key={path ?? 'read'}
+            source={{ png: image.base64 }}
+            columns={box.columns}
+            rows={box.rows}
+            alt={`[image] ${name}`}
+          />
+        ) : null}
         {path ? (
           <Text dimColor>
-            <Link href={fileUrl(path)} label={path} />
+            <Link key={path} href={fileUrl(path)} label={path} />
           </Text>
         ) : null}
       </Box>
@@ -588,7 +544,7 @@ export const register: Register = on => {
         ? { width: image.scaled.original_width, height: image.scaled.original_height }
         : null
 
-      if (image.size > MAX_READ_BYTES) {
+      if (image.size > MAX_INLINE_BYTES) {
         remember(key, { size: original, png: null })
         continue
       }
@@ -596,7 +552,7 @@ export const register: Register = on => {
       try {
         const { base64 } = await $.fs.read(image.path, { as: 'bytes' })
         const size = pngSize(base64)
-        const png = size && image.size <= MAX_INLINE_BYTES ? base64 : null
+        const png = size && pngBytes(base64) <= MAX_INLINE_BYTES ? base64 : null
         remember(key, { size: size ?? original, png })
       } catch {
         remember(key, { size: original, png: null })
@@ -605,6 +561,7 @@ export const register: Register = on => {
 
     const viewportColumns = e.viewport?.columns ?? SEND_MAX_COLUMNS + MARGIN
     const maxColumns = Math.max(10, Math.min(SEND_MAX_COLUMNS, viewportColumns - MARGIN))
+    let remaining = MAX_INLINE_BYTES
     const others = attachments.filter(file => !images.includes(file))
     const { Box, Text, Image, Link } = $.ui.resolve(e)
 
@@ -613,23 +570,26 @@ export const register: Register = on => {
         {output.caption ? <Text dimColor>{output.caption}</Text> : null}
         {images.map(image => {
           const picture = pictures.get(cacheKey(image))
+          const bytes = Math.max(image.size, picture?.png ? pngBytes(picture.png) : 0)
+          const png = picture?.png && bytes <= remaining ? picture.png : null
+          if (bytes > remaining) remaining = 0
+          else if (png) remaining -= bytes
           const box = boxFor(picture?.size ?? FALLBACK_SIZE, maxColumns, SEND_MAX_ROWS)
           const name = image.path.split('/').pop() ?? image.path
 
           return (
             <Box key={image.path} flexDirection="column" gap={1}>
-              <Image
-                source={
-                  picture?.png
-                    ? { png: picture.png }
-                    : { file: image.path, format: 'png', generation: image.size }
-                }
-                columns={box.columns}
-                rows={box.rows}
-                alt={`[image] ${name}`}
-              />
+              {png ? (
+                <Image
+                  key={image.path}
+                  source={{ png }}
+                  columns={box.columns}
+                  rows={box.rows}
+                  alt={`[image] ${name}`}
+                />
+              ) : null}
               <Text dimColor>
-                <Link href={fileUrl(image.path)} label={image.path} />
+                <Link key={image.path} href={fileUrl(image.path)} label={image.path} />
               </Text>
             </Box>
           )
@@ -655,64 +615,33 @@ export const register: Register = on => {
 
     const paths = pathsIn(e.text, home)
     const images = (e.attachments ?? []).filter(item => item.type === 'image')
-    const pictures = (await Promise.all(paths.map(path => pictureFor($, path)))).filter(
-      (picture): picture is TPromptPicture => picture !== null,
-    )
-
-    // Attachments beyond the paths named, for a prompt typed at this terminal.
-    // One the engine kept a file name for was dropped or pasted as a file: it is
-    // the clipboard's file only when the names agree, else Spotlight finds it by
-    // name. One without a name came as bytes, and only the clipboard has those;
-    // at most one such paste is recoverable.
-    const extra = images.slice(paths.length)
-    let engine: TEngineImages | undefined
-    const engineDir = extra.length > 0 && isOwn(e.origin) ? await engineImagesDir($) : null
-    if (engineDir) {
-      // The engine writes its own copy of each attachment as it is pasted: the
-      // newest copies not drawn for an earlier prompt are this one's.
-      engine = { dir: engineDir, wanted: extra.length }
-    } else if (extra.length > 0 && isLocal(e.origin)) {
-      const seen = new Set(pictures.map(picture => picture.source))
-      const add = async (source: string) => {
-        const picture = await pictureFor($, source)
-        if (picture && !seen.has(picture.source)) {
-          seen.add(picture.source)
-          pictures.push(picture)
-        }
-      }
-      const onClipboard = await clipboardFile($)
-      let unnamed = 0
-      for (const item of extra) {
-        if (!item.filename) {
-          unnamed += 1
-          continue
-        }
-        const found =
-          onClipboard && baseName(onClipboard) === item.filename ? onClipboard : await locateByName($, item.filename)
-        if (found) await add(found)
-      }
-      if (unnamed > 0) {
-        const captured = onClipboard ?? (await clipboardBytes($))
-        if (captured) await add(captured)
-      }
-    }
-
-    if (pictures.length === 0 && !engine) {
+    if (paths.length === 0 && images.length === 0) {
       claimedByText.delete(e.text)
       return next(e)
     }
 
-    const entry: TPending = { text: e.text, pictures, at: await $.clock.now(), engine }
-    // Read off the submit path: the row's first draw waits for this read, and a
-    // copy still being written is read at a later redraw.
-    if (entry.engine) {
-      entry.resolving = resolveEngineImages($, entry)
-        .catch(() => undefined)
-        .finally(() => {
-          entry.resolving = undefined
-        })
-    }
+    const entry: TPending = { text: e.text, pictures: [], at: await $.clock.now() }
     rememberPending(entry)
+    // Let submit continue while paths convert and the engine's independent attachments resolve.
+    entry.resolving = (async () => {
+      const pictures = await Promise.all(paths.map(path => pictureFor($, path)))
+      for (const picture of pictures) {
+        if (picture && !entry.pictures.some(known => known.source === picture.source)) entry.pictures.push(picture)
+      }
+      const dir = images.length > 0 ? await engineImagesDir($) : null
+      if (dir) {
+        entry.engine = { dir, wanted: images.length, resolved: 0 }
+        await resolveEngineImages($, entry)
+      }
+      if (entry.pictures.length === 0 && !entry.engine) {
+        claimedByText.delete(e.text)
+        forgetPending(entry)
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        entry.resolving = undefined
+      })
     const entered = await next(e)
     if (entered.drop !== undefined) forgetPending(entry)
 
@@ -731,8 +660,12 @@ export const register: Register = on => {
     const drawn: { picture: TPromptPicture; png: string | null }[] = []
     for (const picture of pictures) {
       const inline = picture.bytes <= remaining
-      remaining = inline ? remaining - picture.bytes : 0
-      drawn.push({ picture, png: inline ? await promptPng($, picture.file) : null })
+      const png = inline ? await promptPng($, picture.file, picture.generation) : null
+      const bytes = Math.max(picture.bytes, png ? pngBytes(png) : 0)
+      const fits = png !== null && bytes <= remaining
+      if (png) remaining = fits ? remaining - bytes : 0
+      else if (!inline) remaining = 0
+      drawn.push({ picture, png: fits ? png : null })
     }
 
     const line = await next(e)
@@ -749,15 +682,17 @@ export const register: Register = on => {
 
           return (
             <Box key={picture.source} flexDirection="column" gap={1} marginLeft={2}>
-              <Image
-                key={picture.source}
-                source={png ? { png } : { file: picture.file, format: 'png', generation: picture.generation }}
-                columns={box.columns}
-                rows={box.rows}
-                alt={`[image] ${name}`}
-              />
+              {png ? (
+                <Image
+                  key={picture.source}
+                  source={{ png }}
+                  columns={box.columns}
+                  rows={box.rows}
+                  alt={`[image] ${name}`}
+                />
+              ) : null}
               <Text dimColor>
-                <Link href={fileUrl(picture.source)} label={picture.source} />
+                <Link key={picture.source} href={fileUrl(picture.source)} label={picture.source} />
               </Text>
             </Box>
           )
