@@ -59,9 +59,18 @@ export const pngSize = (base64: string): TSize | null => {
 const pngBytes = (base64: string) =>
   (base64.length * 3) / 4 - (base64.endsWith('==') ? 2 : base64.endsWith('=') ? 1 : 0)
 
+// Accept the absolute paths supplied by either POSIX or Windows engines.
+const isAbsolute = (path: string) => path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
+
+// Forward slashes let the filesystem API read Windows paths consistently.
+const normalizePath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) ? path.replace(/\\/g, '/') : path
+
+// Both platforms' separators can occur in attachment names.
+const baseName = (path: string) => path.split(/[\\/]/).pop() ?? path
+
 const isDrawable = (file: TAttachment) =>
   file.isImage &&
-  file.path.startsWith('/') &&
+  isAbsolute(file.path) &&
   /\.png$/i.test(file.path) &&
   file.pathValidated !== false
 
@@ -78,7 +87,14 @@ const remember = (key: string, picture: TPicture) => {
   }
 }
 
-const fileUrl = (path: string) => `file://${path.split('/').map(encodeURIComponent).join('/')}`
+// Preserve a Windows drive colon while encoding names for clickable local links.
+export const fileUrl = (path: string) => {
+  const normalized = normalizePath(path)
+  if (/^[A-Za-z]:\//.test(normalized)) {
+    return `file:///${normalized.slice(0, 2)}${normalized.slice(2).split('/').map(encodeURIComponent).join('/')}`
+  }
+  return `file://${normalized.split('/').map(encodeURIComponent).join('/')}`
+}
 
 const boxFor = ({ width, height }: TSize, maxColumns: number, maxRows: number) => {
   let columns = Math.min(maxColumns, Math.max(1, Math.round(width / 10)))
@@ -114,7 +130,7 @@ const readImage = (output: unknown, path?: string): TReadImage | null => {
 // ---- the person's own prompts ----
 // `file` is the PNG the terminal draws; `source` is what the person named or
 // pasted, linked below the picture. They differ when the source needed converting.
-type TPromptPicture = { file: string; source: string; size: TSize; bytes: number; generation: number }
+type TPromptPicture = { file: string; source: string; size: TSize | null; bytes: number; generation: number }
 // The engine's own copies of a prompt's attachments, still to be read: the
 // folder it writes them to and how many the prompt attached.
 type TEngineImages = { dir: string; wanted: number; resolved: number }
@@ -141,6 +157,7 @@ const promptPngs = new Map<string, string>()
 
 // Cache each file version separately so an overwrite cannot reuse stale bytes.
 const promptPng = async ($: EngineInterface, file: string, generation: number): Promise<string | null> => {
+  if (!isPng(file)) return null
   const key = `${file}:${generation}`
   try {
     const cached = promptPngs.get(key)
@@ -183,6 +200,9 @@ const rememberRow = (requestId: string, text: string, pictures: TPromptPicture[]
 let home = ''
 let uid = ''
 let captureDir = ''
+let platform: 'darwin' | 'linux' | 'win32' = 'darwin'
+let engineRoot = ''
+let converter: Promise<keyof typeof CONVERTERS | null> | undefined
 
 // Only the person's own prompts: typed here, or sent from Remote Control.
 const isOwn = (origin: PromptOrigin) => origin.kind === 'composer' || origin.kind === 'bridge'
@@ -231,17 +251,17 @@ const claim = async ($: EngineInterface, requestId: string, text: string, now: n
 
 
 
-// Every still-image format `sips` turns into PNG; the terminal draws PNG alone.
+// Only still-image formats can be converted for the terminal's PNG element.
 const IMAGE_PATTERN = /\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i
 
 // Absolute or ~/ paths ending in an image extension: quoted, backslash-escaped, or plain.
 // A plain path starts the text or follows whitespace or an opener, so `src/logo.png`
 // does not yield `/logo.png`.
 const PATH_PATTERN =
-  /"((?:\/|~\/)[^"\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))"|'((?:\/|~\/)[^'\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))'|(?<=^|[\s([,:=])((?:\/|~\/)(?:[^\s\\"']|\\ )+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))(?=[\s,;:)\]]|$)/gim
+  /"((?:[A-Za-z]:[\\/]|\/|~\/)[^"\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))"|'((?:[A-Za-z]:[\\/]|\/|~\/)[^'\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))'|(?<=^|[\s([,:=])((?:[A-Za-z]:[\\/]|\/|~\/)(?:[^\s"']|\\ )+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))(?=[\s,;:)\]]|$)/gim
 
 // A pasted image the engine expanded with its source file.
-const SOURCE_PATTERN = /\[Image: source: (\/[^\]\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))\]/gi
+const SOURCE_PATTERN = /\[Image: source: ((?:[A-Za-z]:[\\/]|\/)[^\]\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))\]/gi
 
 const isPng = (path: string) => /\.png$/i.test(path)
 
@@ -252,37 +272,47 @@ const hashOf = (text: string) => {
   return hash.toString(36)
 }
 
-export const pathsIn = (text: string, homeDir: string) => {
+export const pathsIn = (text: string, homeDir: string, pathPlatform = platform) => {
   const found = new Set<string>()
 
   for (const match of text.matchAll(SOURCE_PATTERN)) {
-    if (match[1]) found.add(match[1])
+    if (match[1]) found.add(normalizePath(match[1]))
   }
 
   for (const match of text.matchAll(PATH_PATTERN)) {
     const raw = match[1] ?? match[2] ?? match[3]
     if (!raw) continue
-    const unescaped = raw.replace(/\\ /g, ' ')
-    const absolute = unescaped.startsWith('~/') ? `${homeDir}${unescaped.slice(1)}` : unescaped
-    if (absolute.startsWith('/') && !absolute.includes('/../')) found.add(absolute)
+    if (pathPlatform !== 'win32' && !/^[A-Za-z]:[\\/]/.test(raw) && match[3] && /\\(?! )/.test(raw)) continue
+    const unescaped = pathPlatform === 'win32' || /^[A-Za-z]:[\\/]/.test(raw) ? raw : raw.replace(/\\ /g, ' ')
+    const absolute = normalizePath(unescaped.startsWith('~/') ? `${homeDir}${unescaped.slice(1)}` : unescaped)
+    if (pathPlatform === 'win32' && match[3]?.includes('\\ ')) continue
+    if (isAbsolute(absolute) && !absolute.includes('/../')) found.add(absolute)
   }
 
   return [...found].slice(0, MAX_PATHS)
 }
 
-const sizeOf = async ($: EngineInterface, path: string): Promise<TSize> => {
-  try {
-    const { exitCode, stdout } = await $.process.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', path], {
-      timeoutMs: 5000,
-    })
-    if (exitCode !== 0) return FALLBACK_SIZE
-    const width = Number(/pixelWidth:\s*(\d+)/.exec(stdout)?.[1])
-    const height = Number(/pixelHeight:\s*(\d+)/.exec(stdout)?.[1])
-    return width > 0 && height > 0 ? { width, height } : FALLBACK_SIZE
-  } catch {
-    return FALLBACK_SIZE
-  }
+// Keep each supported converter's argv together so no conversion needs a shell.
+const CONVERTERS = {
+  sips: (source: string, target: string) => ['sips', '-s', 'format', 'png', source, '--out', target],
+  magick: (source: string, target: string) => ['magick', source, target],
+  convert: (source: string, target: string) => ['convert', source, target],
+  ffmpeg: (source: string, target: string) => ['ffmpeg', '-y', '-i', source, '-frames:v', '1', target],
 }
+
+// Share even an unsuccessful probe across all non-PNG images in a session.
+const converterFor = ($: EngineInterface) => converter ??= (async () => {
+  if (platform === 'darwin') return 'sips' as const
+  for (const tool of ['magick', 'convert', 'ffmpeg'] as const) {
+    try {
+      const { exitCode } = await $.process.run([tool, '-version'], { timeoutMs: 5000 })
+      if (exitCode === 0) return tool
+    } catch {
+      // A missing executable leaves the next converter available to try.
+    }
+  }
+  return null
+})()
 
 // A PNG copy of any other still image, kept in the capture folder and reused
 // while the source is unchanged. Nothing without a capture folder.
@@ -291,7 +321,9 @@ const toPng = async ($: EngineInterface, source: string, generation: number): Pr
   const target = `${captureDir}/conv-${hashOf(source)}-${generation}.png`
   try {
     if (await $.fs.exists(target)) return target
-    const { exitCode } = await $.process.run(['sips', '-s', 'format', 'png', source, '--out', target], {
+    const tool = await converterFor($)
+    if (!tool) return null
+    const { exitCode } = await $.process.run(CONVERTERS[tool](source, target), {
       timeoutMs: 15000,
     })
     if (exitCode !== 0) return null
@@ -310,7 +342,7 @@ const pictureFor = async ($: EngineInterface, source: string): Promise<TPromptPi
     const file = isPng(source) ? source : (await toPng($, source, generation)) ?? source
     const bytes = file === source ? stat.size : (await $.fs.stat(file)).size
     const png = bytes <= MAX_INLINE_BYTES ? await promptPng($, file, generation) : null
-    const size = (png && pngSize(png)) || await sizeOf($, file)
+    const size = png ? pngSize(png) : null
     return { file, source, size, bytes, generation }
   } catch {
     return null
@@ -324,9 +356,8 @@ const engineImagesDir = async ($: EngineInterface): Promise<string | null> => {
   if (!uid) return null
   try {
     const [id, cwd] = await Promise.all([$.session.id(), $.session.cwd()])
-    if (!id || !cwd.startsWith('/')) return null
-    const root = ((await $.env.get('CLAUDE_CODE_TMPDIR')) || '/private/tmp').replace(/\/$/, '')
-    const dir = `${root}/claude-${uid}`
+    if (!id || !isAbsolute(cwd)) return null
+    const dir = `${engineRoot}/claude-${uid}`
     const slug = cwdSlug(cwd)
     if (cwd.length <= CWD_SLUG_LIMIT) {
       const images = `${dir}/${slug}/${id}/images`
@@ -382,7 +413,7 @@ const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
     for (const name of fresh) {
       const path = `${engine.dir}/${name}`
       const target = `${captureDir}/engine-${id}-${name}`
-      const { exitCode } = await $.process.run(['cp', path, target], { timeoutMs: 5000 })
+      const { exitCode } = await copyFile($, path, target)
       if (exitCode !== 0) continue
       const picture = await pictureFor($, target)
       if (!picture) continue
@@ -400,27 +431,99 @@ const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
   }
 }
 
-// A private folder under the user's own temp dir; yesterday's captures go.
-const prepareCaptureDir = async ($: EngineInterface) => {
+// PowerShell literals keep spaces, quotes and metacharacters inside the path.
+const psLiteral = (path: string) => `'${path.replace(/'/g, "''")}'`
+
+// A whole PowerShell command is one argv element on Windows.
+const powershell = (command: string) => ['powershell', '-NoProfile', '-NonInteractive', '-Command', command]
+
+// The engine has no mkdir API, so use the platform's directory command.
+const makeFolder = ($: EngineInterface, dir: string) => $.process.run(
+  platform === 'win32'
+    ? powershell(`New-Item -ItemType Directory -Force -LiteralPath ${psLiteral(dir)}`)
+    : ['mkdir', '-p', '-m', '700', dir],
+  { timeoutMs: 5000 },
+)
+
+// Image bytes need a process copy because the filesystem write API is text-only.
+const copyFile = ($: EngineInterface, from: string, to: string) => $.process.run(
+  platform === 'win32'
+    ? powershell(`Copy-Item -LiteralPath ${psLiteral(from)} -Destination ${psLiteral(to)}`)
+    : ['cp', from, to],
+  { timeoutMs: 5000 },
+)
+
+// Delete only selected captures without depending on a filesystem delete API.
+const deleteFile = ($: EngineInterface, path: string) => $.process.run(
+  platform === 'win32'
+    ? powershell(`Remove-Item -LiteralPath ${psLiteral(path)}`)
+    : ['rm', '-f', path],
+  { timeoutMs: 5000 },
+)
+
+// Bound cleanup to old capture files so startup cannot delete unrelated files or run indefinitely.
+const pruneCaptures = async ($: EngineInterface) => {
+  const cutoff = await $.clock.now() - 24 * 60 * 60 * 1000
+  const entries = await $.fs.list(captureDir)
+  const old = entries.filter(entry =>
+    entry.kind === 'file' && /^(?:paste-|conv-|engine-)/.test(entry.name) && entry.mtimeMs < cutoff,
+  ).slice(0, 200)
+  for (const entry of old) {
+    try {
+      await deleteFile($, `${captureDir}/${entry.name}`)
+    } catch {
+      // A capture that disappeared or cannot be removed must not block the next one.
+    }
+  }
+}
+
+// Detect once at session start because the engine exposes no platform field.
+const detectPlatform = async ($: EngineInterface, os: string | undefined, userProfile: string | undefined, homeDir: string | undefined) => {
+  if (os === 'Windows_NT' || (userProfile && !homeDir)) return 'win32'
   try {
-    const { exitCode, stdout } = await $.process.run(
-      ['sh', '-c', 'printf "%s\\n%s\\n%s" "$HOME" "${TMPDIR:-}" "$(id -u)"'],
-      { timeoutMs: 5000 },
-    )
-    if (exitCode !== 0) return
-    const [homeDir = '', tmpDir = '', userId = ''] = stdout.split('\n')
-    home = homeDir.trim()
-    uid = /^\d+$/.test(userId.trim()) ? userId.trim() : ''
-    const base = tmpDir.trim().replace(/\/$/, '') || (home ? `${home}/.cache` : '')
+    const { exitCode, stdout } = await $.process.run(['uname', '-s'], { timeoutMs: 5000 })
+    if (exitCode === 0 && stdout.trim() === 'Darwin') return 'darwin'
+  } catch {
+    // Linux is the fallback when uname is unavailable.
+  }
+  return 'linux'
+}
+
+// A private folder under the user's own temp dir retains captures for one day.
+const prepareCaptureDir = async ($: EngineInterface) => {
+  home = ''
+  uid = ''
+  captureDir = ''
+  engineRoot = ''
+  converter = undefined
+  try {
+    const [homeDir, tmpDir, temp, tmp, userProfile, os, engineTmp] = await Promise.all([
+      $.env.get('HOME'),
+      $.env.get('TMPDIR'),
+      $.env.get('TEMP'),
+      $.env.get('TMP'),
+      $.env.get('USERPROFILE'),
+      $.env.get('OS'),
+      $.env.get('CLAUDE_CODE_TMPDIR'),
+    ])
+    platform = await detectPlatform($, os, userProfile, homeDir)
+    home = normalizePath((platform === 'win32' ? userProfile : homeDir) || '')
+    const base = normalizePath(platform === 'win32'
+      ? temp || tmp || (home ? `${home}/AppData/Local/Temp` : '')
+      : tmpDir || (home ? `${home}/.cache` : '')).replace(/\/$/, '')
+    if (platform === 'win32') uid = '0'
+    else {
+      const { exitCode, stdout } = await $.process.run(['id', '-u'], { timeoutMs: 5000 })
+      if (exitCode === 0 && /^\d+$/.test(stdout.trim())) uid = stdout.trim()
+    }
+    // The Windows engine is assumed to use %TEMP% as Node's temp dir; unverified on a real machine.
+    engineRoot = normalizePath(engineTmp || (platform === 'darwin' ? '/private/tmp' : platform === 'linux' ? '/tmp' : base)).replace(/\/$/, '')
     if (!base) return
     const dir = `${base}/${CAPTURE_FOLDER}`
-    const made = await $.process.run(['mkdir', '-p', '-m', '700', dir], { timeoutMs: 5000 })
+    const made = await makeFolder($, dir)
     if (made.exitCode !== 0) return
     captureDir = dir
-    await $.process.run(
-      ['find', dir, '-maxdepth', '1', '-type', 'f', '(', '-name', 'paste-*', '-o', '-name', 'conv-*', '-o', '-name', 'engine-*', ')', '-mtime', '+1', '-delete'],
-      { timeoutMs: 10000 },
-    )
+    await pruneCaptures($)
   } catch {
     captureDir = ''
   }
@@ -454,7 +557,7 @@ export const register: Register = on => {
         {line}
         {images.map((image, index) => {
           const box = boxFor(image.size, maxColumns, READ_MAX_ROWS)
-          const name = image.path?.split('/').pop() ?? 'image.png'
+          const name = image.path ? baseName(image.path) : 'image.png'
 
           return (
             <Box key={`${index}:${image.path ?? ''}`} flexDirection="column" gap={1} marginLeft={2}>
@@ -501,7 +604,7 @@ export const register: Register = on => {
     const maxColumns = Math.max(10, Math.min(READ_MAX_COLUMNS, viewportColumns - MARGIN))
     const box = boxFor(image.size, maxColumns, READ_MAX_ROWS)
     const path = image.path
-    const name = path?.split('/').pop() ?? 'image.png'
+    const name = path ? baseName(path) : 'image.png'
     const { Box, Text, Image, Link } = $.ui.resolve(e)
 
     return (
@@ -550,7 +653,7 @@ export const register: Register = on => {
       }
 
       try {
-        const { base64 } = await $.fs.read(image.path, { as: 'bytes' })
+        const { base64 } = await $.fs.read(normalizePath(image.path), { as: 'bytes' })
         const size = pngSize(base64)
         const png = size && pngBytes(base64) <= MAX_INLINE_BYTES ? base64 : null
         remember(key, { size: size ?? original, png })
@@ -575,7 +678,7 @@ export const register: Register = on => {
           if (bytes > remaining) remaining = 0
           else if (png) remaining -= bytes
           const box = boxFor(picture?.size ?? FALLBACK_SIZE, maxColumns, SEND_MAX_ROWS)
-          const name = image.path.split('/').pop() ?? image.path
+          const name = baseName(image.path)
 
           return (
             <Box key={image.path} flexDirection="column" gap={1}>
@@ -677,12 +780,13 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1}>
         {line}
         {drawn.map(({ picture, png }) => {
-          const box = boxFor(picture.size, maxColumns, PROMPT_MAX_ROWS)
-          const name = picture.source.split('/').pop() ?? 'image.png'
+          const size = png ? picture.size ?? pngSize(png) : null
+          const box = size ? boxFor(size, maxColumns, PROMPT_MAX_ROWS) : null
+          const name = baseName(picture.source)
 
           return (
             <Box key={picture.source} flexDirection="column" gap={1} marginLeft={2}>
-              {png ? (
+              {png && box ? (
                 <Image
                   key={picture.source}
                   source={{ png }}

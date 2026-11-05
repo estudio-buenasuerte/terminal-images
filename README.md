@@ -50,7 +50,17 @@ Paths in the prompt text are drawn directly: absolute or `~/` paths ending in `.
 
 A drawn row is remembered by its message id and by its text, so when the engine draws the same prompt again under another id (it does once the message is stored, and on later redraws) the pictures stay under it.
 
-The terminal draws PNG alone, so any other format is converted with `sips` into a private folder under `TMPDIR` (`claude-prompt-images`, mode 700), reused while the source is unchanged and pruned after a day. The prompt part is macOS only: it shells out to `sips`.
+The terminal draws PNG alone, so any other format is converted with `sips` into a private folder under `TMPDIR` (`claude-prompt-images`, mode 700), reused while the source is unchanged and pruned after a day. The converter table uses `sips` on macOS as described above; Linux and Windows try ImageMagick 7 (`magick`), ImageMagick 6 (`convert`) and `ffmpeg` in that order, keeping the clickable source link if no converter is found or conversion fails.
+
+## Platforms
+
+- macOS: tested by Lucas. Uses `sips` and a private capture folder under `TMPDIR` (or `~/.cache`), mode 700; the default engine temp root is `/private/tmp`.
+- Linux: untested (stub tests only). The default engine temp root is `/tmp`; capture files use `TMPDIR` or `~/.cache`.
+- Windows: untested (stub tests only). The engine temp root is assumed to be Node's temp directory, `%TEMP%`; this is unverified on a real Windows machine. Capture files use `TEMP`, then `TMP`, then `%USERPROFILE%/AppData/Local/Temp`, and folder, copy and delete operations use PowerShell. The engine uses `claude-0` for its image folder.
+
+Outside macOS, install ImageMagick (`magick` or `convert`) or `ffmpeg` to convert non-PNG prompt images. Without one, those images show their links; PNG images need no converter. `CLAUDE_CODE_TMPDIR` overrides the engine temp root on every platform.
+
+If the engine does not detect your terminal's image support, set `CLAUDE_CODE_FORCE_TERMINAL_IMAGES=1` as an escape hatch.
 
 ## Known limits
 
