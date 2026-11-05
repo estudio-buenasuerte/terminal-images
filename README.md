@@ -44,7 +44,7 @@ set -g focus-events on
 
 ## How prompt images are found
 
-Pasted and dropped attachments are drawn from the engine's own copies, the numbered files Claude Code writes under `/private/tmp/claude-<uid>/<cwd>/<session>/images/` for the model. The engine writes one the moment an image is pasted, and the newest ones not yet drawn for an earlier prompt are that prompt's, so what is drawn is exactly what the model received, whatever the clipboard holds and whichever tool produced the image.
+Pasted and dropped attachments come from the numbered files Claude Code writes under `<CLAUDE_CODE_TMPDIR or /private/tmp>/claude-<uid>/<slug>/<session>/images/`, where the slug replaces every character outside `[a-zA-Z0-9]` in the working directory with `-` and, above 200 characters, uses the first 200 followed by `-` and an engine hash. The engine's copies are copied into the mod's capture folder and drawn from PNG bytes up to 2 MiB total per row; after a picture would exceed that budget, it and the remaining pictures are drawn from their capture-folder files. The engine writes one the moment an image is pasted, and the newest ones not yet drawn for an earlier prompt are that prompt's, so what is drawn is exactly what the model received, whatever the clipboard holds and whichever tool produced the image.
 
 Only when that folder cannot be located does the mod fall back to the clipboard: an attachment with a file name is matched to the clipboard's file by name, else found by name with Spotlight; one without a name is read from the clipboard as the file it points to, else as PNG bytes, else as the TIFF every macOS image copy carries. At most one such paste per prompt.
 
@@ -70,7 +70,7 @@ claude plugin test ~/.claude/skills/terminal-images
 npx -p typescript tsc --noEmit -p ~/.claude/skills/terminal-images
 ```
 
-The tests cover the Read, SendUserFile and grouped-Read rendering and the prompt path parsing. The engine-copy, clipboard and Spotlight paths need a live session.
+The tests cover the Read, SendUserFile and grouped-Read rendering, prompt path parsing, and engine-copy prompt rendering and redraws. The clipboard and Spotlight paths need a live session.
 
 The plugin API this mod uses is early access in Claude Code and may change between releases.
 

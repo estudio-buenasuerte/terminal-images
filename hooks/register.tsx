@@ -103,7 +103,7 @@ const readImage = (output: unknown, path?: string): TReadImage | null => {
 // ---- the person's own prompts ----
 // `file` is the PNG the terminal draws; `source` is what the person named or
 // pasted, linked below the picture. They differ when the source needed converting.
-type TPromptPicture = { file: string; source: string; size: TSize; generation: number }
+type TPromptPicture = { file: string; source: string; size: TSize; bytes: number; generation: number }
 // The engine's own copies of a prompt's attachments, still to be read: the
 // folder it writes them to and how many the prompt attached.
 type TEngineImages = { dir: string; wanted: number }
@@ -123,6 +123,26 @@ const PENDING_LIMIT = 20
 const PENDING_TTL_MS = 2 * 60 * 1000
 const ROWS_LIMIT = 200
 const CAPTURE_FOLDER = 'claude-prompt-images'
+const CWD_SLUG_LIMIT = 200
+
+// Rows retain paths alone so old transcript pictures do not retain megabytes of bytes.
+const promptPngs = new Map<string, string>()
+
+const promptPng = async ($: EngineInterface, file: string): Promise<string | null> => {
+  try {
+    const cached = promptPngs.get(file)
+    const base64 = cached ?? (await $.fs.read(file, { as: 'bytes' })).base64
+    promptPngs.delete(file)
+    promptPngs.set(file, base64)
+    if (promptPngs.size > CACHE_LIMIT) {
+      const oldest = promptPngs.keys().next().value
+      if (oldest !== undefined) promptPngs.delete(oldest)
+    }
+    return base64
+  } catch {
+    return null
+  }
+}
 
 // Prompts whose pictures are known but whose transcript row has not drawn yet.
 const pending: TPending[] = []
@@ -276,7 +296,10 @@ const pictureFor = async ($: EngineInterface, source: string): Promise<TPromptPi
     const generation = Math.round(stat.mtimeMs)
     const file = isPng(source) ? source : await toPng($, source, generation)
     if (!file) return null
-    return { file, source, size: await sizeOf($, file), generation }
+    const bytes = file === source ? stat.size : (await $.fs.stat(file)).size
+    const png = bytes <= MAX_INLINE_BYTES ? await promptPng($, file) : null
+    const size = (png && pngSize(png)) || await sizeOf($, file)
+    return { file, source, size, bytes, generation }
   } catch {
     return null
   }
@@ -366,15 +389,27 @@ const locateByName = async ($: EngineInterface, filename: string): Promise<strin
   }
 }
 
-// Where the engine writes its own copy of each attachment, numbered in order:
-// /private/tmp/claude-<uid>/<cwd with every slash a dash>/<session id>/images.
-// These are what the model receives, whatever the clipboard holds.
+export const cwdSlug = (cwd: string) => cwd.replace(/[^a-zA-Z0-9]/g, '-').slice(0, CWD_SLUG_LIMIT)
+
+// The engine's copies are what the model receives, whatever the clipboard holds.
 const engineImagesDir = async ($: EngineInterface): Promise<string | null> => {
   if (!uid) return null
   try {
     const [id, cwd] = await Promise.all([$.session.id(), $.session.cwd()])
     if (!id || !cwd.startsWith('/')) return null
-    return `/private/tmp/claude-${uid}/${cwd.replace(/\//g, '-')}/${id}/images`
+    const root = ((await $.env.get('CLAUDE_CODE_TMPDIR')) || '/private/tmp').replace(/\/$/, '')
+    const dir = `${root}/claude-${uid}`
+    const slug = cwdSlug(cwd)
+    if (cwd.length <= CWD_SLUG_LIMIT) return `${dir}/${slug}/${id}/images`
+
+    // The engine appends a hash we cannot compute to a truncated slug.
+    const entries = await $.fs.list(dir)
+    for (const entry of entries) {
+      if (entry.kind !== 'dir' || !entry.name.startsWith(slug)) continue
+      const images = `${dir}/${entry.name}/${id}/images`
+      if (await $.fs.exists(images)) return images
+    }
+    return null
   } catch {
     return null
   }
@@ -403,22 +438,32 @@ const claimedEngineFiles = new Set<string>()
 // `wanted` of them. Nothing there yet leaves the entry waiting for a later redraw.
 const resolveEngineImages = async ($: EngineInterface, entry: TPending) => {
   const engine = entry.engine
-  if (!engine) return
+  if (!engine || !captureDir) return
   const names = await engineImages($, engine.dir)
   const fresh = names.filter(name => !claimedEngineFiles.has(`${engine.dir}/${name}`)).slice(-engine.wanted)
   if (fresh.length === 0) return
 
-  for (const name of fresh) {
-    const path = `${engine.dir}/${name}`
-    claimedEngineFiles.add(path)
-    if (claimedEngineFiles.size > CLAIMED_LIMIT) {
-      const oldest = claimedEngineFiles.values().next().value
-      if (oldest !== undefined) claimedEngineFiles.delete(oldest)
+  try {
+    const id = await $.session.id()
+    if (!id) return
+    for (const name of fresh) {
+      const path = `${engine.dir}/${name}`
+      const target = `${captureDir}/engine-${id}-${name}`
+      const { exitCode } = await $.process.run(['cp', path, target], { timeoutMs: 5000 })
+      if (exitCode !== 0) continue
+      const picture = await pictureFor($, target)
+      if (!picture) continue
+      claimedEngineFiles.add(path)
+      if (claimedEngineFiles.size > CLAIMED_LIMIT) {
+        const oldest = claimedEngineFiles.values().next().value
+        if (oldest !== undefined) claimedEngineFiles.delete(oldest)
+      }
+      if (!entry.pictures.some(known => known.source === picture.source)) entry.pictures.push(picture)
     }
-    const picture = await pictureFor($, path)
-    if (picture && !entry.pictures.some(known => known.source === picture.source)) entry.pictures.push(picture)
+    if (fresh.every(name => claimedEngineFiles.has(`${engine.dir}/${name}`))) entry.engine = undefined
+  } catch {
+    // a copy that failed stays pending for a later redraw
   }
-  entry.engine = undefined
 }
 
 // A private folder under the user's own temp dir; yesterday's captures go.
@@ -439,7 +484,7 @@ const prepareCaptureDir = async ($: EngineInterface) => {
     if (made.exitCode !== 0) return
     captureDir = dir
     await $.process.run(
-      ['find', dir, '-maxdepth', '1', '-type', 'f', '(', '-name', 'paste-*', '-o', '-name', 'conv-*', ')', '-mtime', '+1', '-delete'],
+      ['find', dir, '-maxdepth', '1', '-type', 'f', '(', '-name', 'paste-*', '-o', '-name', 'conv-*', '-o', '-name', 'engine-*', ')', '-mtime', '+1', '-delete'],
       { timeoutMs: 10000 },
     )
   } catch {
@@ -652,7 +697,10 @@ export const register: Register = on => {
       }
     }
 
-    if (pictures.length === 0 && !engine) return next(e)
+    if (pictures.length === 0 && !engine) {
+      claimedByText.delete(e.text)
+      return next(e)
+    }
 
     const entry: TPending = { text: e.text, pictures, at: await $.clock.now(), engine }
     // Read off the submit path: the row's first draw waits for this read, and a
@@ -679,6 +727,14 @@ export const register: Register = on => {
     const pictures = await claim($, e.requestId, e.props.text, await $.clock.now())
     if (!pictures || pictures.length === 0) return next(e)
 
+    let remaining = MAX_INLINE_BYTES
+    const drawn: { picture: TPromptPicture; png: string | null }[] = []
+    for (const picture of pictures) {
+      const inline = picture.bytes <= remaining
+      remaining = inline ? remaining - picture.bytes : 0
+      drawn.push({ picture, png: inline ? await promptPng($, picture.file) : null })
+    }
+
     const line = await next(e)
     const viewportColumns = e.viewport?.columns ?? PROMPT_MAX_COLUMNS + MARGIN
     const maxColumns = Math.max(10, Math.min(PROMPT_MAX_COLUMNS, viewportColumns - MARGIN))
@@ -687,14 +743,15 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column" gap={1}>
         {line}
-        {pictures.map(picture => {
+        {drawn.map(({ picture, png }) => {
           const box = boxFor(picture.size, maxColumns, PROMPT_MAX_ROWS)
           const name = picture.source.split('/').pop() ?? 'image.png'
 
           return (
             <Box key={picture.source} flexDirection="column" gap={1} marginLeft={2}>
               <Image
-                source={{ file: picture.file, format: 'png', generation: picture.generation }}
+                key={picture.source}
+                source={png ? { png } : { file: picture.file, format: 'png', generation: picture.generation }}
                 columns={box.columns}
                 rows={box.rows}
                 alt={`[image] ${name}`}
