@@ -128,6 +128,23 @@ const CAPTURE_FOLDER = 'claude-prompt-images'
 const pending: TPending[] = []
 // Transcript rows (by message id) that already matched a prompt.
 const rows = new Map<string, TPromptPicture[]>()
+// The same pictures by prompt text: the engine can draw a prompt's row again
+// under another message id, and that draw has no pending entry left to match.
+const claimedByText = new Map<string, TPromptPicture[]>()
+
+const rememberRow = (requestId: string, text: string, pictures: TPromptPicture[]) => {
+  rows.set(requestId, pictures)
+  if (rows.size > ROWS_LIMIT) {
+    const oldest = rows.keys().next().value
+    if (oldest !== undefined) rows.delete(oldest)
+  }
+  claimedByText.delete(text)
+  claimedByText.set(text, pictures)
+  if (claimedByText.size > ROWS_LIMIT) {
+    const oldest = claimedByText.keys().next().value
+    if (oldest !== undefined) claimedByText.delete(oldest)
+  }
+}
 
 let home = ''
 let uid = ''
@@ -159,7 +176,11 @@ const claim = async ($: EngineInterface, requestId: string, text: string, now: n
 
   const index = pending.findIndex(entry => entry.text === text)
   const entry = pending[index]
-  if (!entry) return null
+  if (!entry) {
+    const drawn = claimedByText.get(text)
+    if (drawn) rememberRow(requestId, text, drawn)
+    return drawn ?? null
+  }
 
   if (entry.resolving) await entry.resolving
   else if (entry.engine) await resolveEngineImages($, entry)
@@ -167,11 +188,7 @@ const claim = async ($: EngineInterface, requestId: string, text: string, now: n
   if (entry.pictures.length === 0) return null
 
   pending.splice(index, 1)
-  rows.set(requestId, entry.pictures)
-  if (rows.size > ROWS_LIMIT) {
-    const oldest = rows.keys().next().value
-    if (oldest !== undefined) rows.delete(oldest)
-  }
+  rememberRow(requestId, text, entry.pictures)
 
   return entry.pictures
 }
@@ -188,7 +205,7 @@ const IMAGE_PATTERN = /\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i
 // A plain path starts the text or follows whitespace or an opener, so `src/logo.png`
 // does not yield `/logo.png`.
 const PATH_PATTERN =
-  /"((?:\/|~\/)[^"\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))"|'((?:\/|~\/)[^'\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))'|(?<=^|[\s(\[,:=])((?:\/|~\/)(?:[^\s\\"']|\\ )+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))(?=[\s,;:)\]]|$)/gim
+  /"((?:\/|~\/)[^"\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))"|'((?:\/|~\/)[^'\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))'|(?<=^|[\s([,:=])((?:\/|~\/)(?:[^\s\\"']|\\ )+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))(?=[\s,;:)\]]|$)/gim
 
 // A pasted image the engine expanded with its source file.
 const SOURCE_PATTERN = /\[Image: source: (\/[^\]\n]+?\.(?:png|jpe?g|gif|webp|heic|heif|tiff?|bmp))\]/gi
@@ -657,7 +674,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'UserMessage' }, async ($, e, next) => {
     if (e.surface !== 'terminal' || !isOwn(e.props.origin)) return next(e)
     // Most rows have no picture waiting: no clock hop for them.
-    if (!rows.has(e.requestId) && pending.length === 0) return next(e)
+    if (!rows.has(e.requestId) && pending.length === 0 && !claimedByText.has(e.props.text)) return next(e)
 
     const pictures = await claim($, e.requestId, e.props.text, await $.clock.now())
     if (!pictures || pictures.length === 0) return next(e)

@@ -50,6 +50,8 @@ Only when that folder cannot be located does the mod fall back to the clipboard:
 
 Paths in the prompt text are drawn directly: absolute or `~/` paths ending in `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic`, `.heif`, `.tif`, `.tiff` or `.bmp`, plain, quoted or backslash-escaped, plus the `[Image: source: …]` marker the engine adds to a pasted image.
 
+A drawn row is remembered by its message id and by its text, so when the engine draws the same prompt again under another id (it does once the message is stored, and on later redraws) the pictures stay under it.
+
 The terminal draws PNG alone, so any other format is converted with `sips` into a private folder under `TMPDIR` (`claude-prompt-images`, mode 700), reused while the source is unchanged and pruned after a day. Clipboard captures go to the same folder. The prompt part is macOS only: it shells out to `osascript`, `sips` and `mdfind`.
 
 ## What it does not do
